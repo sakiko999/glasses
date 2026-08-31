@@ -1,0 +1,9 @@
+node_modules
+dist
+tmp
+.DS_Store
+*.local
+.vite
+.env
+.env.*
+.claude/plans
