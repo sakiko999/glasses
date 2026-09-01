@@ -6,4 +6,4 @@ tmp
 .vite
 .env
 .env.*
-.claude/plans
+.claude
