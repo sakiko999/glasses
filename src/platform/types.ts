@@ -58,9 +58,35 @@ export interface GpuContext {
   format: GPUTextureFormat;
 }
 
+/**
+ * Canvas2D-shaped drawing context, as a type alias rather than a structural
+ * interface: the Canvas2D API is the app-painting contract by decision
+ * (docs/app-system.md) and is emulatable on any native 2D stack (Skia/Cairo).
+ */
+export type PaintContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+/**
+ * Platform-owned 2D painting surface (web: an OffscreenCanvas wrapper).
+ * Constructed ONLY via PlatformHost.createPaintSurface — app and shell code
+ * must never construct a canvas themselves; that factory is the portability
+ * seam. `backend` is opaque and exists solely for the platform's own pixel
+ * upload path; all other consumers go through the typed methods.
+ */
+export interface PaintSurface {
+  readonly width: number;
+  readonly height: number;
+  readonly devicePixelRatio: number;
+  getContext2D(): PaintContext;
+  /** Blit this surface's full backing store into another paint context. */
+  blitInto(dest: PaintContext, dx: number, dy: number, dw: number, dh: number): void;
+  readonly backend: unknown;
+}
+
 export interface PlatformHost {
   clock: PlatformClock;
   surface: PlatformSurface;
   input: PlatformInput;
+  /** Offscreen 2D surface factory — the ONLY sanctioned way to get one. */
+  createPaintSurface(width: number, height: number, dpr: number): PaintSurface;
   createGpu(): Promise<GpuContext>;
 }

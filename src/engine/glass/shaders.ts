@@ -114,8 +114,10 @@ struct GlassUniforms {
   tintCorner: vec4f,
   // bevel, titleBarHeight, shadowStrength, curvature
   shapeExtra: vec4f,
-  // sceneDistance, milkiness, _pad0, _pad1
+  // sceneDistance, milkiness, hover, press
   params3: vec4f,
+  // contentPad (logical px of texture padding around the rect), _pad0..2
+  params4: vec4f,
 }
 
 @group(0) @binding(0) var sceneTex: texture_2d<f32>;
@@ -208,7 +210,13 @@ fn surfaceHeight(ctx: SurfaceCtx, p: vec2f) -> f32 {
   let edgeT = 1.0 - saturate(ds / max(ctx.bevel, 1.0));
   let edgeFall = pow(edgeT, 1.6);
   let nq = p / max(ctx.halfSize, vec2f(1.0));
-  let liq = fbm2(nq * 1.7 + vec2f(ctx.phase, -ctx.phase * 0.7)) - 0.5;
+  // Uniform-derived branch: liquidity == 0 (every default preset) skips the
+  // fbm. surfaceHeight runs 5× per pixel for the lighting gradient — the
+  // noise was ~20 of the shader's fbm evaluations even with liquid off.
+  var liq = 0.0;
+  if (ctx.liqAmp > 0.0) {
+    liq = fbm2(nq * 1.7 + vec2f(ctx.phase, -ctx.phase * 0.7)) - 0.5;
+  }
   let hBody = ctx.depth * (ctx.minRatio + (1.0 - ctx.minRatio) * dome);
   return hBody * (1.0 - edgeFall) + liq * ctx.liqAmp;
 }
@@ -216,6 +224,10 @@ fn surfaceHeight(ctx: SurfaceCtx, p: vec2f) -> f32 {
 fn sampleScene(uv: vec2f, rough: f32) -> vec3f {
   let suv = clamp(uv, vec2f(0.001), vec2f(0.999));
   let sharp = textureSampleLevel(sceneTex, samp, suv, 0.0).rgb;
+  // Per-pixel skip: clear-glass body (rough ≈ 0) never reads the blur chain.
+  if (rough < 0.004) {
+    return sharp;
+  }
   let soft = textureSampleLevel(blurTex, samp, suv, 0.0).rgb;
   return mix(sharp, soft, saturate(rough));
 }
@@ -245,6 +257,8 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
   let curvature = max(u.shapeExtra.w, 0.05);
   let sceneDistance = max(u.params3.x, 1.0);
   let milkiness = saturate(u.params3.y);
+  let hover = saturate(u.params3.z);
+  let press = saturate(u.params3.w);
 
   let screen = uv * viewport;
   let rectPos = u.rect.xy;
@@ -281,12 +295,15 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
   // into an outward bend term that grows to the border. Both amplitudes vary
   // monotonically along the radius, so the composed mapping is monotonic.
 
-  // Radial direction: analytic superellipse (n=4) normal field. The SDF
-  // gradient is discontinuous on the medial axis / corner bisectors and would
-  // crease the refraction into visible facets; q³ is smooth everywhere.
+  // Radial direction: ELLIPTICAL field (not the n=4 superellipse). The
+  // superellipse gradient q³ has a curvature seam on the |qx|=|qy| diagonal
+  // — the value is continuous (C¹) but the direction's rate of change jumps
+  // there, which prints the faint "crease". The pure ellipse normalize(q)
+  // is C∞ everywhere (no corner, no seam), still anisotropic (respects the
+  // pane aspect), and — since the offset amplitude is ~0 near center — the
+  // center singularity is harmless. This removes the diagonal crease.
   let q = p / max(halfSize, vec2f(1.0));
-  let dirRaw = q * q * q;
-  let dirOut = dirRaw / max(length(dirRaw), 1e-4);
+  let dirOut = q / max(length(q), 1e-4);
 
   let bandW = max(bevel, 8.0);
 
@@ -302,8 +319,9 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
   // Offset transition band: wider than the optical bevel (~2.2×) so the
   // background shears gently, capped by the pane inradius so small windows
-  // keep a coherent flat middle.
-  let offBand = min(max(bandW * 2.2, 96.0), inR * 0.55);
+  // keep a coherent flat middle. The 96px floor is clamped to the inradius
+  // so control-tier panes (inR ≈ 13px) don't turn fully into transition.
+  let offBand = min(max(bandW * 2.2, min(96.0, inR * 0.8)), inR * 0.55);
   let offT = 1.0 - saturate(ds / offBand); // 0 body → 1 border (wide ramp)
 
   let ctx = SurfaceCtx(
@@ -337,28 +355,38 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
   // prints content jumps: a scene strip sampled twice, neighbours skipped).
   let bendAmp = max(
     min(
-      clamp(sceneDistance * 0.12, 6.0, bandW * 0.55) * edgeBoost,
+      // Relative clamp floor: an absolute 6px floor would swallow the whole
+      // band on control-tier panes (bevel ≈ 10px).
+      clamp(sceneDistance * 0.12, bandW * 0.1, bandW * 0.55) * edgeBoost,
       offBand * 0.45 - lensMag * length(halfSize),
     ),
     0.0,
   );
   let bendOffset = dirOut * bendAmp * bendS;
 
-  // Liquid ripple (default 0 — the glass is static)
-  let nq = p / max(halfSize, vec2f(1.0));
-  let lq1 = fbm2(nq * 1.7 + vec2f(time * liquidSpeed, -time * liquidSpeed * 0.7)) - 0.5;
-  let lq2 = fbm2(nq * 2.3 - vec2f(time * liquidSpeed * 0.5, time * liquidSpeed * 0.9)) - 0.5;
-  let liqOff = vec2f(lq1, lq2) * liquidity * depth * 0.15;
+  // Liquid ripple (default 0 — the glass is static). Uniform branch.
+  var liqOff = vec2f(0.0);
+  if (liquidity > 0.0) {
+    let nq = p / max(halfSize, vec2f(1.0));
+    let lq1 = fbm2(nq * 1.7 + vec2f(time * liquidSpeed, -time * liquidSpeed * 0.7)) - 0.5;
+    let lq2 = fbm2(nq * 2.3 - vec2f(time * liquidSpeed * 0.5, time * liquidSpeed * 0.9)) - 0.5;
+    liqOff = vec2f(lq1, lq2) * liquidity * depth * 0.15;
+  }
 
   let offG = lensOffset + bendOffset + liqOff;
-  let offR = offG * (1.0 + dispersion);
-  let offB = offG * (1.0 - dispersion);
-
   let roughEff = clamp(roughness * (0.45 + 0.55 * edge01), 0.0, 1.0);
-  let colR = sampleScene(uv + offR / viewport, roughEff).r;
-  let colG = sampleScene(uv + offG / viewport, roughEff).g;
-  let colB = sampleScene(uv + offB / viewport, roughEff).b;
-  var body = vec3f(colR, colG, colB);
+  // Uniform branch: dispersion == 0 collapses three scene samples into one.
+  var body: vec3f;
+  if (dispersion > 0.0) {
+    let offR = offG * (1.0 + dispersion);
+    let offB = offG * (1.0 - dispersion);
+    let colR = sampleScene(uv + offR / viewport, roughEff).r;
+    let colG = sampleScene(uv + offG / viewport, roughEff).g;
+    let colB = sampleScene(uv + offB / viewport, roughEff).b;
+    body = vec3f(colR, colG, colB);
+  } else {
+    body = sampleScene(uv + offG / viewport, roughEff);
+  }
 
   // Path length from the droplet dome (thick apex, thin rim)
   let path = max(2.0 * h0, 2.0);
@@ -410,16 +438,30 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
   var glass = body * (1.0 - w * 0.35) + envBright * w;
 
   // Thin bright line at the silhouette (last ~30px, gentle rise)
-  glass += vec3f(0.9, 0.95, 1.0) * pow(edgeT, 3.5) * 0.18 * specular;
+  glass += vec3f(0.9, 0.95, 1.0) * pow(edgeT, 3.5) * (0.18 + 0.12 * hover) * specular;
   // Polished edge hairline (last ~3px): seals the seam where the refracted
   // background meets the undisplaced outside. May clip to white — that is
   // the crisp edge read, not a bug.
   glass += vec3f(0.95, 0.98, 1.0) * pow(edgeT, 12.0) * 0.22 * specular;
+
+  // Interaction trims (control tier): additive only, no smoothstep knees —
+  // an amplified normal sweep crossing a knee prints iso-lines (the 45°
+  // crease lesson). Hover breathes on the rim; press dims the body while
+  // the shell raises shadowStrength for the lift.
+  glass *= 1.0 - press * 0.06;
   glass += vec3f(1.0, 0.98, 0.95) * spec * 0.9 * specular;
 
   // ---- Content as inner film (stable: no parallax → no edge smear) ----
+  // contentPad: the film texture covers rect + pad on every side (crop
+  // headroom against device-pixel rounding). Map the rect back into the
+  // padded texture 1:1 — no stretch, edges intact.
+  let pad = max(u.params4.x, 0.0);
   let localFromTopLeft = (local - rectPos) / rectSize;
-  let contentUV = clamp(localFromTopLeft, vec2f(0.0), vec2f(1.0));
+  let contentUV = clamp(
+    (localFromTopLeft * rectSize + vec2f(pad)) / (rectSize + vec2f(2.0 * pad)),
+    vec2f(0.0),
+    vec2f(1.0),
+  );
 
   let content = textureSampleLevel(contentTex, contentSamp, contentUV, 0.0);
   glass = glass * (1.0 - content.a) + content.rgb;

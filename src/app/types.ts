@@ -1,6 +1,8 @@
 import type { Size } from '@/math/types';
 import type { GlassMaterial } from '@/engine/glass/material';
-import type { KeyEventLike, PointerEventLike } from '@/platform/types';
+import type { KeyEventLike, PaintContext, PointerEventLike } from '@/platform/types';
+
+export type { PaintContext, PaintSurface } from '@/platform/types';
 
 export interface AppManifest {
   id: string;
@@ -23,7 +25,7 @@ export interface ContentSurface {
   readonly width: number;
   readonly height: number;
   readonly dpr: number;
-  get2D(): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+  get2D(): PaintContext;
   invalidate(): void;
 }
 
@@ -42,6 +44,21 @@ export interface TimeApi {
   dt(): number;
 }
 
+/**
+ * Control-tier glass declaration in content-local logical px. The GPU draws
+ * the glass substrate; the app keeps painting only the control's content
+ * (label, track fill, knob) into the content surface at the same rect.
+ */
+export interface ControlSpec {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  hovered?: boolean;
+  pressed?: boolean;
+}
+
 export interface AppContext {
   readonly appId: string;
   readonly instanceId: string;
@@ -49,6 +66,8 @@ export interface AppContext {
   readonly content: ContentSurface;
   readonly time: TimeApi;
   readonly theme: ThemeTokens;
+  /** Declare glass controls for this frame; call during onRender. */
+  setControls(controls: ControlSpec[]): void;
   emit(event: string, payload?: unknown): void;
   on(event: string, cb: (payload: unknown) => void): () => void;
 }

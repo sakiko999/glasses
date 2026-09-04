@@ -216,6 +216,14 @@ export class WindowManager {
     return removed;
   }
 
+  /** True while any open/close animation is mid-flight (render-on-demand). */
+  get animating(): boolean {
+    for (const w of this.windows.values()) {
+      if (Math.abs(w.anim - w.animTarget) > 0.001) return true;
+    }
+    return false;
+  }
+
   toLayers(): Layer[] {
     return this.list().map((w) => {
       const t = easeOutCubic(w.anim);

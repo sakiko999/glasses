@@ -1,24 +1,21 @@
+import type { PaintSurface } from '@/platform/types';
+
 /**
  * Canvas2D poster-style wallpaper.
  *
  * Glass refraction/dispersion reads best over high-contrast type on light
  * paper (see docs/liquid-glass.md), so the default wallpaper is a typographic
  * poster: big serif headline, thin accent rules, monospace captions.
+ *
+ * Takes a platform PaintSurface whose context is already dpr-scaled.
  */
 export function paintPosterWallpaper(
-  canvas: OffscreenCanvas | HTMLCanvasElement,
+  surface: PaintSurface,
   width: number,
   height: number,
-  dpr: number,
 ): void {
-  const pw = Math.max(1, Math.floor(width * dpr));
-  const ph = Math.max(1, Math.floor(height * dpr));
-  if (canvas.width !== pw) canvas.width = pw;
-  if (canvas.height !== ph) canvas.height = ph;
-
-  const c = canvas.getContext('2d');
-  if (!c) return;
-  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const c = surface.getContext2D();
+  c.clearRect(0, 0, width, height);
 
   const w = Math.max(1, Math.floor(width));
   const h = Math.max(1, Math.floor(height));

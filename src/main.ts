@@ -24,6 +24,8 @@ async function main(): Promise<void> {
     const host = await createWebHost(canvas);
     const gpu = await host.createGpu();
     const desktop = new Desktop(host, gpu);
+    // Dev FPS overlay — composition root owns the DOM mount point.
+    desktop.debugStats.attach(gpu.device, document.body);
 
     desktop.registerApp(createGlassLabApp(desktop.glassBridge));
     desktop.registerApp(clockApp);

@@ -45,7 +45,8 @@ export class Scheduler {
     }
   }
 
-  runContentPaints(): void {
+  /** Executes pending paints; returns how many ran (0 = nothing repainted). */
+  runContentPaints(): number {
     const paints = [...this.dirtyPaints.entries()];
     this.dirtyPaints.clear();
     for (const [id, paint] of paints) {
@@ -55,5 +56,6 @@ export class Scheduler {
         console.error(`[Scheduler] paint ${id} failed:`, err);
       }
     }
+    return paints.length;
   }
 }

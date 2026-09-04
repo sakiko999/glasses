@@ -2,6 +2,7 @@ import type { GpuContext, PlatformHost } from '../types';
 import { createWebClock } from './clock';
 import { createWebSurface } from './surface';
 import { createWebInput } from './input';
+import { createOffscreenPaintSurface } from './paint-surface';
 
 export async function createWebHost(canvas: HTMLCanvasElement): Promise<PlatformHost> {
   const clock = createWebClock();
@@ -12,6 +13,7 @@ export async function createWebHost(canvas: HTMLCanvasElement): Promise<Platform
     clock,
     surface,
     input,
+    createPaintSurface: createOffscreenPaintSurface,
     async createGpu(): Promise<GpuContext> {
       if (!navigator.gpu) {
         throw new Error(

@@ -1,19 +1,21 @@
 import type { PlatformHost, PointerEventLike, KeyEventLike, GpuContext } from '@/platform/types';
-import type { FrameScene } from '@/engine/layers';
+import type { ControlGlass, FrameScene, Layer } from '@/engine/layers';
 import { Compositor } from '@/engine/compositor';
 import type { GlassMaterial } from '@/engine/glass/material';
-import { defaultGlassMaterial } from '@/engine/glass/material';
+import { controlMaterial, controlShape, defaultGlassMaterial } from '@/engine/glass/material';
 import { EventBus } from '@/runtime/events';
 import { Scheduler } from '@/runtime/scheduler';
 import { FrameLoop } from '@/runtime/frame-loop';
+import { DebugStats } from '@/runtime/debug-stats';
 import { AppRegistry } from '@/app/registry';
 import {
   DEFAULT_THEME,
   type AppInstance,
   type AppContext,
   type AppModule,
+  type ControlSpec,
 } from '@/app/types';
-import { OffscreenContentSurface, type ContentSurfaceHost } from '@/app/content-surface';
+import { CanvasContentSurface, type ContentSurfaceHost } from '@/app/content-surface';
 import { createId } from '@/math/id';
 import { rectContains } from '@/math/rect';
 import { WindowManager, type WindowId } from './window-manager';
@@ -22,14 +24,25 @@ import { Launcher } from './launcher';
 import { paintWindowChrome } from './chrome-painter';
 import { paintPosterWallpaper } from './wallpaper-painter';
 
+/** Desktop item: a solid 3D glass object (v1: sphere), below all windows. */
+interface DesktopObject {
+  id: string;
+  pos: { x: number; y: number };
+  diameter: number;
+}
+
 interface RunningApp {
   instanceId: string;
   appId: string;
   windowId: WindowId;
   instance: AppInstance;
-  surface: OffscreenContentSurface;
+  surface: CanvasContentSurface;
   /** Full window surface including title bar for GPU upload */
-  chromeSurface: OffscreenContentSurface;
+  chromeSurface: CanvasContentSurface;
+  /** Control-tier glass declared by the app (content-local coords) */
+  controls: ControlSpec[];
+  /** Marks whether cropped control textures need re-upload after a chrome paint */
+  controlsDirty: boolean;
 }
 
 /**
@@ -48,18 +61,33 @@ export class Desktop {
   private readonly apps = new Map<string, RunningApp>();
   private readonly byWindow = new Map<WindowId, string>();
   private readonly frameLoop: FrameLoop;
+  /** Dev-only FPS overlay; the composition root attaches it to the DOM. */
+  readonly debugStats = new DebugStats();
 
   private drag:
     | { windowId: WindowId; offsetX: number; offsetY: number }
     | null = null;
+  private objectDrag: { id: string; offsetX: number; offsetY: number } | null = null;
+  private readonly objects: DesktopObject[] = [];
+  private objectMaterial: GlassMaterial = defaultGlassMaterial();
 
   private globalMaterial: GlassMaterial = defaultGlassMaterial();
-  private launcherSurface: OffscreenContentSurface | null = null;
+  /** Control-tier glass presence 0–1 (Glass Lab slider, default calm) */
+  private controlIntensity = 0.35;
+  /** Smoothed interaction state per control, key = instanceId:controlId */
+  private readonly controlStates = new Map<string, { hover: number; press: number }>();
+  private launcherSurface: CanvasContentSurface | null = null;
   private launcherDirty = true;
   private lastDt = 0;
   private elapsed = 0;
+  /** Render-on-demand: set by any state change that alters the composited scene. */
+  private sceneDirty = true;
   private wallpaperTexture: GPUTexture | null = null;
   private wallpaperSize: { w: number; h: number } = { w: 0, h: 0 };
+
+  private markDirty(): void {
+    this.sceneDirty = true;
+  }
 
   constructor(host: PlatformHost, gpu: GpuContext) {
     this.host = host;
@@ -92,6 +120,11 @@ export class Desktop {
         }
       },
       applyToFocused: true,
+      getControlIntensity: () => this.controlIntensity,
+      setControlIntensity: (v: number) => {
+        this.controlIntensity = Math.min(1, Math.max(0, v));
+        this.refreshChrome();
+      },
     };
   }
 
@@ -105,10 +138,30 @@ export class Desktop {
     this.host.surface.resizeToDisplay();
     this.ensureWallpaper();
     this.ensureLauncherSurface();
+    this.spawnDemoObjects();
     // Auto-launch demo apps
     this.launch('builtin.glass-lab');
     this.launch('builtin.clock');
     this.frameLoop.start();
+  }
+
+  /** Demo desktop item: one crystal ball, bottom-left, below all windows. */
+  private spawnDemoObjects(): void {
+    const vw = this.host.surface.width;
+    const vh = this.host.surface.height;
+    this.objectMaterial = defaultGlassMaterial({
+      sceneDistance: 320,
+      dispersion: 0.05,
+      absorption: 0.008,
+      roughness: 0.03,
+      specular: 1.1,
+    });
+    const d = Math.round(Math.min(210, Math.max(150, vh * 0.17)));
+    this.objects.push({
+      id: createId('obj'),
+      pos: { x: Math.round(vw * 0.12), y: Math.round(vh - d - 80) },
+      diameter: d,
+    });
   }
 
   stop(): void {
@@ -170,8 +223,8 @@ export class Desktop {
         if (!app) return;
         this.scheduler.requestContentPaint(app.windowId, () => this.paintWindow(app));
       },
-      uploadContent: (id, canvas) => {
-        const tex = this.contentTextures.upload(id, canvas);
+      uploadContent: (id, surface) => {
+        const tex = this.contentTextures.upload(id, surface);
         if (id.startsWith('chrome-')) {
           const wid = id.slice('chrome-'.length);
           this.wm.setContentTexture(wid, tex);
@@ -179,17 +232,18 @@ export class Desktop {
           this.launcher.setContentTexture(tex);
         }
       },
+      createSurface: (w, h, d) => this.host.createPaintSurface(w, h, d),
     };
 
     const contentH = Math.max(1, win.bounds.height - win.titleBarHeight);
-    const contentSurface = new OffscreenContentSurface(
+    const contentSurface = new CanvasContentSurface(
       `content-${windowId}`,
       win.bounds.width,
       contentH,
       dpr,
       hostApi,
     );
-    const chromeSurface = new OffscreenContentSurface(
+    const chromeSurface = new CanvasContentSurface(
       `chrome-${windowId}`,
       win.bounds.width,
       win.bounds.height,
@@ -204,6 +258,10 @@ export class Desktop {
     };
 
     const self = this;
+    const controlHolder: { specs: ControlSpec[]; app: RunningApp | null } = {
+      specs: [],
+      app: null,
+    };
     const appCtx: AppContext = {
       appId,
       instanceId,
@@ -218,6 +276,13 @@ export class Desktop {
       },
       content: contentSurface,
       time: timeApi,
+      setControls: (specs) => {
+        controlHolder.specs = specs;
+        if (controlHolder.app) {
+          controlHolder.app.controls = specs;
+          controlHolder.app.controlsDirty = true;
+        }
+      },
       theme: DEFAULT_THEME,
       emit: (e, p) => self.events.emit(e, p),
       on: (e, cb) => self.events.on(e, cb),
@@ -239,7 +304,10 @@ export class Desktop {
       instance,
       surface: contentSurface,
       chromeSurface,
+      controls: controlHolder.specs,
+      controlsDirty: true,
     };
+    controlHolder.app = running;
     this.apps.set(instanceId, running);
     this.byWindow.set(windowId, instanceId);
 
@@ -273,6 +341,9 @@ export class Desktop {
     }
     this.scheduler.removeUpdate(app.instanceId);
     this.scheduler.cancelContentPaint(app.windowId);
+    for (const spec of app.controls) {
+      this.contentTextures.destroy(`ctl-${app.windowId}-${spec.id}`);
+    }
     this.contentTextures.destroy(`chrome-${app.windowId}`);
     this.contentTextures.destroy(`content-${app.windowId}`);
     this.apps.delete(app.instanceId);
@@ -322,22 +393,47 @@ export class Desktop {
 
     const chromeCtx = app.chromeSurface.get2D();
     paintWindowChrome(chromeCtx, win, DEFAULT_THEME, () => {
-      // blit content canvas into chrome at title offset (already translated)
-      const src = app.surface.getCanvas();
-      chromeCtx.drawImage(
-        src,
-        0,
-        0,
-        src.width,
-        src.height,
+      // Blit the app content into the chrome texture at title offset
+      app.surface.paintSurface.blitInto(
+        chromeCtx,
         0,
         0,
         app.surface.width,
         app.surface.height,
       );
+      // Erase control rects from the window film: the control-tier glass
+      // refracts this film (sceneTex), so leaving the content here would
+      // print it twice — once bent inside the control, once as its film.
+      for (const spec of app.controls) {
+        chromeCtx.clearRect(spec.x, spec.y, spec.width, spec.height);
+      }
     });
     app.chromeSurface.commit();
     app.surface.commit(); // clear dirty
+
+    this.uploadControlTextures(app);
+  }
+
+  /**
+   * Crop each declared control out of the content canvas as its own texture
+   * (the chrome copy is erased — controls are drawn by the control tier).
+   */
+  private uploadControlTextures(app: RunningApp): void {
+    if (!app.controls.length) return;
+    const dpr = this.host.surface.devicePixelRatio;
+    // Crop with headroom: the film texture covers rect + CONTENT_PAD on
+    // every side, so device-pixel rounding can never clip the control's
+    // own edge pixels (the shader maps the rect back 1:1 via contentPad).
+    const pad = 2;
+    for (const spec of app.controls) {
+      this.contentTextures.uploadCrop(`ctl-${app.windowId}-${spec.id}`, app.surface.paintSurface, {
+        x: Math.floor((spec.x - pad) * dpr),
+        y: Math.floor((spec.y - pad) * dpr),
+        width: Math.ceil((spec.width + 2 * pad) * dpr),
+        height: Math.ceil((spec.height + 2 * pad) * dpr),
+      });
+    }
+    app.controlsDirty = false;
   }
 
   /** Regenerate + upload the poster wallpaper when the display size changes. */
@@ -346,12 +442,9 @@ export class Desktop {
     const h = this.host.surface.height;
     if (this.wallpaperTexture && this.wallpaperSize.w === w && this.wallpaperSize.h === h) return;
     const dpr = this.host.surface.devicePixelRatio;
-    const canvas = new OffscreenCanvas(
-      Math.max(1, Math.floor(w * dpr)),
-      Math.max(1, Math.floor(h * dpr)),
-    );
-    paintPosterWallpaper(canvas, w, h, dpr);
-    this.wallpaperTexture = this.contentTextures.upload('wallpaper', canvas);
+    const surface = this.host.createPaintSurface(w, h, dpr);
+    paintPosterWallpaper(surface, w, h);
+    this.wallpaperTexture = this.contentTextures.upload('wallpaper', surface);
     this.wallpaperSize = { w, h };
   }
 
@@ -363,12 +456,13 @@ export class Desktop {
       onInvalidate: () => {
         this.launcherDirty = true;
       },
-      uploadContent: (id, canvas) => {
-        const tex = this.contentTextures.upload(id, canvas);
+      uploadContent: (id, surface) => {
+        const tex = this.contentTextures.upload(id, surface);
         this.launcher.setContentTexture(tex);
       },
+      createSurface: (w, h, d) => this.host.createPaintSurface(w, h, d),
     };
-    this.launcherSurface = new OffscreenContentSurface(
+    this.launcherSurface = new CanvasContentSurface(
       'launcher',
       b.width,
       b.height,
@@ -394,10 +488,33 @@ export class Desktop {
       app.surface.invalidate();
     }
     this.launcherDirty = true;
+    this.markDirty();
   }
 
   private onPointer(e: PointerEventLike): void {
+    // Any pointer activity may move windows, toggle hover/press states or
+    // hit the launcher — cheapest correct rule: input dirties the scene.
+    this.markDirty();
     const pos = e.position;
+
+    // Active object drag (desktop items sit below windows, checked after)
+    if (this.objectDrag) {
+      const o = this.objects.find((x) => x.id === this.objectDrag!.id);
+      if (o && (e.phase === 'move' || e.phase === 'down')) {
+        o.pos.x = Math.min(
+          this.host.surface.width - o.diameter - 8,
+          Math.max(8, pos.x - this.objectDrag.offsetX),
+        );
+        o.pos.y = Math.min(
+          this.host.surface.height - o.diameter - 8,
+          Math.max(8, pos.y - this.objectDrag.offsetY),
+        );
+      }
+      if (e.phase === 'up' || e.phase === 'cancel') {
+        this.objectDrag = null;
+      }
+      return;
+    }
 
     // Active drag
     if (this.drag) {
@@ -430,6 +547,12 @@ export class Desktop {
         } else {
           e.preventDefault();
           return;
+        }
+      }
+      if (e.phase === 'move') {
+        const appId = hit && typeof hit === 'object' && 'appId' in hit ? hit.appId : null;
+        if (this.launcher.setHovered(appId)) {
+          this.markDirty();
         }
       }
       if (hit) return;
@@ -469,11 +592,24 @@ export class Desktop {
           };
           app.instance.onPointer?.(local);
         }
-      } else if (e.detail >= 2) {
-        // Double-click desktop → launcher
-        this.launcher.show(this.host.surface.width, this.host.surface.height);
-        this.launcherDirty = true;
-        e.preventDefault();
+      } else {
+        // Desktop items (below windows, above wallpaper)
+        const obj = this.hitObject(pos);
+        if (obj) {
+          this.objectDrag = {
+            id: obj.id,
+            offsetX: pos.x - obj.pos.x,
+            offsetY: pos.y - obj.pos.y,
+          };
+          e.preventDefault();
+          return;
+        }
+        if (e.detail >= 2) {
+          // Double-click desktop → launcher
+          this.launcher.show(this.host.surface.width, this.host.surface.height);
+          this.launcherDirty = true;
+          e.preventDefault();
+        }
       }
       return;
     }
@@ -497,6 +633,12 @@ export class Desktop {
 
   private onKey(e: KeyEventLike): void {
     if (e.phase === 'down') {
+      this.markDirty();
+      if (e.code === 'F3') {
+        this.debugStats.toggle();
+        e.preventDefault();
+        return;
+      }
       // Backquote or Ctrl+Space → launcher
       if (e.code === 'Backquote' || (e.code === 'Space' && e.ctrlKey)) {
         this.launcher.toggle(this.host.surface.width, this.host.surface.height);
@@ -517,7 +659,61 @@ export class Desktop {
     this.apps.get(iid)?.instance.onKey?.(e);
   }
 
+  /** Smooth control interaction state and build the GPU control list. */
+  private buildControls(app: RunningApp, dt: number): ControlGlass[] {
+    if (!app.controls.length) return [];
+    const win = this.wm.get(app.windowId);
+    if (!win || win.bounds.width < 1 || win.bounds.height < 1) return [];
+    const cr = this.wm.contentRect(win);
+    const mat = controlMaterial(win.material, this.controlIntensity);
+    const shape = controlShape(this.controlIntensity);
+    const out: ControlGlass[] = [];
+    for (const spec of app.controls) {
+      const key = `${app.instanceId}:${spec.id}`;
+      let st = this.controlStates.get(key);
+      if (!st) {
+        st = { hover: 0, press: 0 };
+        this.controlStates.set(key, st);
+      }
+      const k = 1 - Math.exp(-14 * dt);
+      st.hover += ((spec.hovered ? 1 : 0) - st.hover) * k;
+      st.press += ((spec.pressed ? 1 : 0) - st.press) * k;
+      out.push({
+        id: spec.id,
+        bounds: {
+          x: cr.x + spec.x,
+          y: cr.y + spec.y,
+          width: spec.width,
+          height: spec.height,
+        },
+        material: mat,
+        shape,
+        contentTexture: this.contentTextures.get(`ctl-${app.windowId}-${spec.id}`),
+        contentPad: 2,
+        hover: st.hover,
+        press: st.press,
+        // Contact shadow gives the capsule elevation over the pane (the
+        // resting-state boundary cue); press adds the additive dim in-shader.
+        shadowStrength: 0.18,
+      });
+    }
+    return out;
+  }
+
+  /** Hit-test desktop objects (circle, slight grab tolerance); topmost last. */
+  private hitObject(pos: { x: number; y: number }): DesktopObject | null {
+    for (let i = this.objects.length - 1; i >= 0; i--) {
+      const o = this.objects[i]!;
+      const dx = pos.x - (o.pos.x + o.diameter * 0.5);
+      const dy = pos.y - (o.pos.y + o.diameter * 0.5);
+      const r = o.diameter * 0.5 + 6;
+      if (dx * dx + dy * dy <= r * r) return o;
+    }
+    return null;
+  }
+
   private frame(dt: number, time: number): void {
+    this.debugStats.begin();
     this.lastDt = dt;
     this.elapsed = time;
     this.host.surface.resizeToDisplay();
@@ -531,12 +727,44 @@ export class Desktop {
         if (app) this.teardownApp(app, true);
       }
     }
+    if (removed.length) this.markDirty();
 
     this.scheduler.runUpdate(dt);
-    this.scheduler.runContentPaints();
+    const painted = this.scheduler.runContentPaints();
 
     if (this.launcher.open && this.launcherDirty) {
       this.paintLauncher();
+      this.markDirty();
+    }
+
+    // Controls hover/press decay toward their 0/1 targets for ~0.4s after
+    // the pointer stops — keep compositing until they settle.
+    let controlsAnimating = false;
+    for (const st of this.controlStates.values()) {
+      if (
+        Math.abs(st.hover - Math.round(st.hover)) > 0.002 ||
+        Math.abs(st.press - Math.round(st.press)) > 0.002
+      ) {
+        controlsAnimating = true;
+        break;
+      }
+    }
+
+    const dirty =
+      this.sceneDirty ||
+      painted > 0 ||
+      this.wm.animating ||
+      controlsAnimating ||
+      this.drag !== null ||
+      this.objectDrag !== null;
+    this.sceneDirty = false;
+
+    const tex = this.host.surface.getCurrentTexture();
+    if (!dirty) {
+      // Nothing changed — re-present the cached frame and skip the composite.
+      this.compositor.presentCached(tex);
+      this.debugStats.end();
+      return;
     }
 
     const scene: FrameScene = {
@@ -544,7 +772,25 @@ export class Desktop {
         this.ensureWallpaper();
         return { texture: this.wallpaperTexture, time };
       })(),
-      layers: this.wm.toLayers(),
+      objects: this.objects.map((o) => ({
+        id: o.id,
+        bounds: { x: o.pos.x, y: o.pos.y, width: o.diameter, height: o.diameter },
+        material: this.objectMaterial,
+        shadowStrength: 0.5,
+        opacity: 1,
+      })),
+      layers: (() => {
+        const layers = this.wm.toLayers();
+        for (const layer of layers) {
+          const iid = this.byWindow.get(layer.id as string);
+          if (!iid) continue;
+          const app = this.apps.get(iid);
+          if (!app) continue;
+          const controls = this.buildControls(app, dt);
+          if (controls.length) layer.controls = controls;
+        }
+        return layers as Layer[];
+      })(),
       overlays: (() => {
         const o = this.launcher.toOverlay();
         return o ? [o] : [];
@@ -557,7 +803,7 @@ export class Desktop {
       time,
     };
 
-    const tex = this.host.surface.getCurrentTexture();
     this.compositor.render(scene, tex);
+    this.debugStats.end();
   }
 }

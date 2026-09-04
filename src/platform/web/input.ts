@@ -4,6 +4,12 @@ export function createWebInput(target: HTMLElement): PlatformInput {
   const pointerCbs = new Set<(e: PointerEventLike) => void>();
   const keyCbs = new Set<(e: KeyEventLike) => void>();
   const lastPos = new Map<number, { x: number; y: number }>();
+  // PointerEvent.detail is specified as always 0 — click counting must be
+  // done by hand (time + distance window) or double-clicks never exist.
+  let clickTime = 0;
+  let clickX = 0;
+  let clickY = 0;
+  let clickCount = 0;
 
   const toLocal = (ev: PointerEvent) => {
     const rect = target.getBoundingClientRect();
@@ -21,6 +27,14 @@ export function createWebInput(target: HTMLElement): PlatformInput {
     } else {
       lastPos.delete(ev.pointerId);
     }
+    if (phase === 'down') {
+      const now = performance.now();
+      const moved = Math.hypot(position.x - clickX, position.y - clickY);
+      clickCount = now - clickTime < 450 && moved < 10 ? clickCount + 1 : 1;
+      clickTime = now;
+      clickX = position.x;
+      clickY = position.y;
+    }
     const event: PointerEventLike = {
       id: ev.pointerId,
       phase,
@@ -32,7 +46,7 @@ export function createWebInput(target: HTMLElement): PlatformInput {
       altKey: ev.altKey,
       ctrlKey: ev.ctrlKey,
       metaKey: ev.metaKey,
-      detail: ev.detail,
+      detail: phase === 'down' ? clickCount : 0,
       preventDefault: () => ev.preventDefault(),
     };
     for (const cb of pointerCbs) cb(event);

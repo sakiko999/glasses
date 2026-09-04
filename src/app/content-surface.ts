@@ -1,20 +1,24 @@
 import type { ContentSurface } from './types';
+import type { PaintContext, PaintSurface } from '@/platform/types';
 
 export interface ContentSurfaceHost {
   onInvalidate(id: string): void;
-  uploadContent(id: string, canvas: OffscreenCanvas | HTMLCanvasElement): void;
+  uploadContent(id: string, surface: PaintSurface): void;
+  /** Platform surface factory — the portability seam (see PlatformHost). */
+  createSurface(width: number, height: number, dpr: number): PaintSurface;
 }
 
 /**
- * Offscreen canvas surface for app content → GPU texture upload.
+ * Canvas-shaped surface for app content → GPU texture upload. The backing
+ * store comes from the platform factory; this class owns only the lifecycle
+ * (size, dpr transform, dirty tracking, commit).
  */
-export class OffscreenContentSurface implements ContentSurface {
+export class CanvasContentSurface implements ContentSurface {
   readonly id: string;
   private _width: number;
   private _height: number;
   private _dpr: number;
-  private canvas: OffscreenCanvas;
-  private ctx: OffscreenCanvasRenderingContext2D;
+  private surface: PaintSurface;
   private readonly host: ContentSurfaceHost;
   private dirty = true;
 
@@ -30,14 +34,7 @@ export class OffscreenContentSurface implements ContentSurface {
     this._height = Math.max(1, Math.floor(height));
     this._dpr = dpr;
     this.host = host;
-    this.canvas = new OffscreenCanvas(
-      Math.max(1, Math.floor(this._width * dpr)),
-      Math.max(1, Math.floor(this._height * dpr)),
-    );
-    const ctx = this.canvas.getContext('2d');
-    if (!ctx) throw new Error('OffscreenCanvas 2D 不可用');
-    this.ctx = ctx;
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.surface = host.createSurface(this._width, this._height, dpr);
   }
 
   get width(): number {
@@ -52,8 +49,13 @@ export class OffscreenContentSurface implements ContentSurface {
     return this._dpr;
   }
 
-  get2D(): OffscreenCanvasRenderingContext2D {
-    return this.ctx;
+  get2D(): PaintContext {
+    return this.surface.getContext2D();
+  }
+
+  /** The backing PaintSurface — for shell-side texture upload only. */
+  get paintSurface(): PaintSurface {
+    return this.surface;
   }
 
   invalidate(): void {
@@ -72,24 +74,13 @@ export class OffscreenContentSurface implements ContentSurface {
     this._width = w;
     this._height = h;
     this._dpr = dpr;
-    this.canvas = new OffscreenCanvas(
-      Math.max(1, Math.floor(w * dpr)),
-      Math.max(1, Math.floor(h * dpr)),
-    );
-    const ctx = this.canvas.getContext('2d');
-    if (!ctx) throw new Error('OffscreenCanvas 2D 不可用');
-    this.ctx = ctx;
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.surface = this.host.createSurface(w, h, dpr);
     this.invalidate();
   }
 
   /** Called by shell after app onRender */
   commit(): void {
     this.dirty = false;
-    this.host.uploadContent(this.id, this.canvas);
-  }
-
-  getCanvas(): OffscreenCanvas {
-    return this.canvas;
+    this.host.uploadContent(this.id, this.surface);
   }
 }

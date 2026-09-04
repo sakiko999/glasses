@@ -136,3 +136,43 @@ export function focusBoost(mat: GlassMaterial): GlassMaterial {
     liquidity: mat.liquidity * 1.05,
   };
 }
+
+/**
+ * Control-tier material: a thin, calm derivative of the window material so
+ * panes and controls read as one substance. `intensity` 0–1 scales how much
+ * glass presence the control has (0 ≈ bare content film, 1 ≈ full control
+ * glass); tint/ior stay inherited so the family remains coherent.
+ *
+ * Roughness/milkiness carry FLOORS, not scalings: a control refracts the pane
+ * it sits on, so against a clear window its body is statistically identical
+ * to the surroundings and the boundary vanishes. A blur + slight whitening
+ * lift makes the capsule read as a distinct object (the Apple recipe:
+ * blurred, slightly lifted material on glass).
+ */
+export function controlMaterial(base: GlassMaterial, intensity: number): GlassMaterial {
+  const i = Math.min(1, Math.max(0, intensity));
+  return {
+    ...base,
+    tint: { ...base.tint },
+    thickness: 3 + 7 * i,
+    curvature: 3.5, // near-flat top — controls don't dome
+    roughness: Math.max(Math.min(0.2, base.roughness * 0.8), 0.14 + 0.14 * i),
+    dispersion: base.dispersion * 0.5,
+    specular: base.specular * 1.1,
+    // Crackdown on the refract: a control is a thin plate — the background
+    // should shift a couple of px, not push the whole face sideways.
+    sceneDistance: Math.min(base.sceneDistance * 0.25, 90),
+    milkiness: Math.max(base.milkiness * 0.5, 0.05 + 0.13 * i),
+    liquidity: 0,
+  };
+}
+
+/** Control-tier shape: small radius and a narrow bend band. */
+export function controlShape(intensity: number): RoundedRectShape {
+  const i = Math.min(1, Math.max(0, intensity));
+  return {
+    kind: 'rounded-rect',
+    cornerRadius: 8 + 4 * i,
+    bevel: 6 + 8 * i,
+  };
+}

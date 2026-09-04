@@ -2,6 +2,7 @@ import type { Rect } from '@/math/types';
 import type { AppManifest } from '@/app/types';
 import { defaultGlassMaterial, defaultWindowShape } from '@/engine/glass/material';
 import type { OverlayRect } from '@/engine/layers';
+import type { PaintContext } from '@/platform/types';
 import { rectContains } from '@/math/rect';
 
 export interface LauncherItemHit {
@@ -16,10 +17,18 @@ export class Launcher {
   private bounds: Rect = { x: 0, y: 0, width: 360, height: 280 };
   private items: AppManifest[] = [];
   private contentTexture: GPUTexture | null = null;
+  private hovered: string | null = null;
   private readonly itemRects: { appId: string; rect: Rect }[] = [];
 
   setApps(list: AppManifest[]): void {
     this.items = list;
+  }
+
+  /** Track pointer hover for row highlight; returns true when it changed. */
+  setHovered(appId: string | null): boolean {
+    if (this.hovered === appId) return false;
+    this.hovered = appId;
+    return true;
   }
 
   setContentTexture(tex: GPUTexture | null): void {
@@ -43,7 +52,7 @@ export class Launcher {
   layout(viewportW: number, viewportH: number): void {
     const width = 380;
     const rowH = 52;
-    const height = Math.min(420, 72 + this.items.length * rowH + 24);
+    const height = Math.min(460, 96 + this.items.length * rowH + 22);
     this.bounds = {
       x: (viewportW - width) * 0.5,
       y: (viewportH - height) * 0.42,
@@ -79,47 +88,89 @@ export class Launcher {
     return 'panel';
   }
 
-  /** Draw launcher content into a 2D context (logical pixels). */
-  paint(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D, dpr: number): void {
+  /**
+   * Draw launcher ink into a 2D context (logical px). Legibility first:
+   * the glass substrate is already the showpiece, so rows get a near-opaque
+   * "paper" card with hairline borders, solid accent icon chips and a
+   * strong hover state — the ink must read over any wallpaper.
+   */
+  paint(ctx: PaintContext, dpr: number): void {
     const w = this.bounds.width;
     const h = this.bounds.height;
     ctx.clearRect(0, 0, w, h);
 
-    // Soft inner fill (glass handles exterior)
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.18)';
-    roundRect(ctx, 0, 0, w, h, 20);
-    ctx.fill();
-
-    ctx.fillStyle = 'rgba(24, 26, 32, 0.9)';
-    ctx.font = '600 18px "Segoe UI", system-ui, sans-serif';
-    ctx.fillText('启动器', 24, 36);
-    ctx.fillStyle = 'rgba(52, 58, 70, 0.65)';
+    // Header
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = 'rgba(24, 26, 32, 0.92)';
+    ctx.font = '600 17px "Segoe UI", system-ui, sans-serif';
+    ctx.fillText('启动器', 24, 34);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(24, 26, 32, 0.45)';
+    ctx.font = '10.5px ui-monospace, monospace';
+    ctx.fillText(`${this.items.length} 个应用`, w - 24, 33);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = 'rgba(52, 58, 70, 0.62)';
     ctx.font = '12px "Segoe UI", system-ui, sans-serif';
-    ctx.fillText('选择应用以打开玻璃窗口', 24, 54);
+    ctx.fillText('选择应用以打开玻璃窗口', 24, 52);
 
+    // Header hairline
+    ctx.strokeStyle = 'rgba(24, 26, 32, 0.14)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(20, 62.5);
+    ctx.lineTo(w - 20, 62.5);
+    ctx.stroke();
+
+    // Rows
     let y = 64;
     const rowH = 52;
     for (const app of this.items) {
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.08)';
+      const hoveredRow = app.id === this.hovered;
+
+      // Paper card: near-opaque so entries read over any backdrop
+      ctx.fillStyle = hoveredRow ? 'rgba(253, 253, 251, 0.85)' : 'rgba(250, 250, 248, 0.6)';
       roundRect(ctx, 20, y, w - 40, rowH - 8, 12);
       ctx.fill();
+      ctx.strokeStyle = hoveredRow ? 'rgba(37, 72, 201, 0.6)' : 'rgba(24, 26, 32, 0.14)';
+      ctx.lineWidth = hoveredRow ? 1.5 : 1;
+      ctx.stroke();
 
-      ctx.fillStyle = 'rgba(45, 79, 216, 0.22)';
-      roundRect(ctx, 32, y + 8, 28, 28, 8);
+      // Icon chip: solid accent anchor
+      ctx.fillStyle = hoveredRow ? 'rgba(31, 51, 122, 0.95)' : 'rgba(37, 72, 201, 0.84)';
+      roundRect(ctx, 30, y + 8, 28, 28, 9);
       ctx.fill();
+      ctx.textAlign = 'center';
+      ctx.font = '14px "Segoe UI", system-ui, sans-serif';
+      ctx.fillText(app.icon ?? '◇', 44, y + 27);
+      ctx.textAlign = 'left';
 
-      ctx.fillStyle = 'rgba(24, 26, 32, 0.92)';
-      ctx.font = '16px "Segoe UI", system-ui, sans-serif';
-      const icon = app.icon ?? '◇';
-      ctx.fillText(icon, 38, y + 28);
-
+      ctx.fillStyle = 'rgba(24, 26, 32, 0.94)';
       ctx.font = '600 15px "Segoe UI", system-ui, sans-serif';
-      ctx.fillText(app.name, 72, y + 22);
-      ctx.fillStyle = 'rgba(52, 58, 70, 0.55)';
-      ctx.font = '11px ui-monospace, monospace';
-      ctx.fillText(app.id, 72, y + 38);
+      ctx.fillText(app.name, 70, y + 22);
+      ctx.fillStyle = 'rgba(52, 58, 70, 0.58)';
+      ctx.font = '10.5px ui-monospace, monospace';
+      ctx.fillText(app.id, 70, y + 37);
+
+      if (hoveredRow) {
+        ctx.textAlign = 'right';
+        ctx.fillStyle = 'rgba(24, 40, 96, 0.85)';
+        ctx.font = '600 16px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText('›', w - 34, y + 28);
+        ctx.textAlign = 'left';
+      }
       y += rowH;
     }
+
+    // Footer hint
+    const fy = h - 14.5;
+    ctx.strokeStyle = 'rgba(24, 26, 32, 0.1)';
+    ctx.beginPath();
+    ctx.moveTo(20, fy - 12.5);
+    ctx.lineTo(w - 20, fy - 12.5);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(24, 26, 32, 0.42)';
+    ctx.font = '10.5px ui-monospace, monospace';
+    ctx.fillText('点击启动 · ` 或 Esc 关闭', 24, fy);
 
     void dpr;
   }
@@ -146,7 +197,7 @@ export class Launcher {
 }
 
 function roundRect(
-  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  ctx: PaintContext,
   x: number,
   y: number,
   w: number,

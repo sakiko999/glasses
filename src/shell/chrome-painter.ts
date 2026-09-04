@@ -1,5 +1,6 @@
 import type { WindowState } from './window-manager';
 import type { ThemeTokens } from '@/app/types';
+import type { PaintContext } from '@/platform/types';
 
 /**
  * Paints window chrome (title + close) into the same content surface above
@@ -10,7 +11,7 @@ import type { ThemeTokens } from '@/app/types';
  * the glass, so both stay tinted by whatever is refracted behind them.
  */
 export function paintWindowChrome(
-  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  ctx: PaintContext,
   win: WindowState,
   theme: ThemeTokens,
   appPaint: () => void,

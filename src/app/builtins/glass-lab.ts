@@ -1,10 +1,11 @@
-import type { AppModule, AppContext } from '../types';
+import type { AppModule, AppContext, ControlSpec } from '../types';
+import type { PaintContext } from '@/platform/types';
 import type { GlassMaterial, GlassPreset } from '@/engine/glass/material';
 import { GLASS_PRESETS } from '@/engine/glass/material';
 import type { PointerEventLike } from '@/platform/types';
 
 interface Slider {
-  key: keyof GlassMaterial;
+  key: keyof GlassMaterial | 'controlIntensity';
   label: string;
   min: number;
   max: number;
@@ -26,6 +27,8 @@ const SLIDERS: Omit<Slider, 'y'>[] = [
   { key: 'liquidSpeed', label: '液态速度', min: 0, max: 1.5, step: 0.01 },
   { key: 'transmission', label: '透射', min: 0.4, max: 1, step: 0.01 },
   { key: 'absorption', label: '吸收', min: 0, max: 0.25, step: 0.005 },
+  // Self-hosted: this control glassifies the very controls it sits on
+  { key: 'controlIntensity', label: '控件玻璃强度', min: 0, max: 1, step: 0.01 },
 ];
 
 const PRESET_TOP = 62;
@@ -38,6 +41,8 @@ export interface GlassLabBridge {
   setMaterial(m: GlassMaterial): void;
   /** When true, material applies to focused window; else global default for new windows */
   applyToFocused: boolean;
+  getControlIntensity(): number;
+  setControlIntensity(v: number): void;
 }
 
 export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
@@ -51,8 +56,14 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
     },
     create(ctx) {
       let material = { ...bridge.getMaterial() };
-      let drag: { key: keyof GlassMaterial; min: number; max: number } | null = null;
-      let activePreset: GlassPreset['id'] | null = null;
+      let drag: { key: Slider['key']; min: number; max: number } | null = null;
+      const matchPreset = (m: GlassMaterial): GlassPreset['id'] | null => {
+        const json = JSON.stringify(m);
+        return GLASS_PRESETS.find((p) => JSON.stringify(p.material) === json)?.id ?? null;
+      };
+      let activePreset: GlassPreset['id'] | null = matchPreset(material);
+      let hoveredId: string | null = null;
+      let pressedId: string | null = null;
       const pad = 20;
 
       const sliders: Slider[] = SLIDERS.map((s, i) => ({
@@ -60,15 +71,20 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
         y: SLIDER_TOP + i * SLIDER_H,
       }));
 
-      const valueOf = (key: keyof GlassMaterial): number => {
+      const valueOf = (key: Slider['key']): number => {
+        if (key === 'controlIntensity') return bridge.getControlIntensity();
         const v = material[key];
         return typeof v === 'number' ? v : 0;
       };
 
-      const setValue = (key: keyof GlassMaterial, v: number) => {
-        (material as Record<string, unknown>)[key] = v;
-        activePreset = null;
-        bridge.setMaterial({ ...material });
+      const setValue = (key: Slider['key'], v: number) => {
+        if (key === 'controlIntensity') {
+          bridge.setControlIntensity(v);
+        } else {
+          (material as Record<string, unknown>)[key] = v;
+          activePreset = null;
+          bridge.setMaterial({ ...material });
+        }
         ctx.content.invalidate();
       };
 
@@ -99,6 +115,7 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
           if (preset) {
             material = { ...preset.material, tint: { ...preset.material.tint } };
             activePreset = preset.id;
+            pressedId = `preset-${preset.id}`;
             bridge.setMaterial({ ...material });
             ctx.content.invalidate();
             e.preventDefault();
@@ -107,20 +124,72 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
           const s = hitSlider(x, y);
           if (s) {
             drag = { key: s.key, min: s.min, max: s.max };
+            pressedId = `slider-${String(s.key)}`;
             const t = Math.min(1, Math.max(0, (x - pad) / (ctx.content.width - pad * 2)));
             const v = s.min + t * (s.max - s.min);
             setValue(s.key, Math.round(v / s.step) * s.step);
             e.preventDefault();
           }
-        } else if (e.phase === 'move' && drag && e.buttons) {
-          const t = Math.min(1, Math.max(0, (x - pad) / (ctx.content.width - pad * 2)));
-          const v = drag.min + t * (drag.max - drag.min);
-          const step = SLIDERS.find((s) => s.key === drag!.key)?.step ?? 0.01;
-          setValue(drag.key, Math.round(v / step) * step);
-          e.preventDefault();
+        } else if (e.phase === 'move') {
+          if (drag && e.buttons) {
+            const t = Math.min(1, Math.max(0, (x - pad) / (ctx.content.width - pad * 2)));
+            const v = drag.min + t * (drag.max - drag.min);
+            const step = SLIDERS.find((s) => s.key === drag!.key)?.step ?? 0.01;
+            setValue(drag.key, Math.round(v / step) * step);
+            e.preventDefault();
+          }
+          // Hover tracking (also while dragging — the grab stays "pressed")
+          const hSlider = hitSlider(x, y);
+          const hPreset = hSlider ? null : hitPreset(x, y);
+          const nextHover = hSlider
+            ? `slider-${String(hSlider.key)}`
+            : hPreset
+              ? `preset-${hPreset.id}`
+              : null;
+          if (nextHover !== hoveredId) {
+            hoveredId = nextHover;
+            ctx.content.invalidate();
+          }
         } else if (e.phase === 'up' || e.phase === 'cancel') {
           drag = null;
+          pressedId = null;
+          ctx.content.invalidate();
         }
+      };
+
+      /** Control rects for the GPU glass tier (content-local coords). */
+      const controlSpecs = (): ControlSpec[] => {
+        const w = ctx.content.width;
+        const specs: ControlSpec[] = [];
+        for (let i = 0; i < GLASS_PRESETS.length; i++) {
+          const p = GLASS_PRESETS[i]!;
+          const r = presetRectAt(i, w, pad);
+          const id = `preset-${p.id}`;
+          specs.push({
+            id,
+            x: r.x,
+            y: r.y,
+            width: r.width,
+            height: r.height,
+            hovered: hoveredId === id,
+            pressed: pressedId === id,
+          });
+        }
+        for (const s of sliders) {
+          const id = `slider-${String(s.key)}`;
+          // Capsule hugs the track + knob only (labels stay outside on the
+          // window film); knob center y = s.y + 19 sits at the capsule mid.
+          specs.push({
+            id,
+            x: pad,
+            y: s.y + 11,
+            width: w - pad * 2,
+            height: 16,
+            hovered: hoveredId === id,
+            pressed: pressedId === id,
+          });
+        }
+        return specs;
       };
 
       return {
@@ -130,11 +199,12 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
           ctx.content.invalidate();
         },
         onUpdate() {
-          // sync if external
+          // sync if external — re-match the preset instead of clearing, so
+          // an externally-set stock material still shows its active button
           const ext = bridge.getMaterial();
           if (JSON.stringify(ext) !== JSON.stringify(material)) {
             material = { ...ext };
-            activePreset = null;
+            activePreset = matchPreset(material);
             ctx.content.invalidate();
           }
         },
@@ -142,7 +212,8 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
           applyPointer(e);
         },
         onRender(surface) {
-          paintLab(ctx, surface.get2D(), material, sliders, pad, activePreset);
+          paintLab(ctx, surface.get2D(), material, sliders, pad, activePreset, valueOf);
+          ctx.setControls(controlSpecs());
         },
         onDispose() {},
       };
@@ -158,11 +229,12 @@ function formatValue(step: number, v: number): string {
 
 function paintLab(
   ctx: AppContext,
-  c: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  c: PaintContext,
   material: GlassMaterial,
   sliders: Slider[],
   pad: number,
   activePreset: GlassPreset['id'] | null,
+  getValue: (key: Slider['key']) => number,
 ): void {
   const w = ctx.content.width;
   const h = ctx.content.height;
@@ -175,15 +247,25 @@ function paintLab(
   c.font = `12px ${ctx.theme.fontUi}`;
   c.fillText('预设一键切换 · 滑条实时作用于当前焦点窗口', pad, 48);
 
-  // Preset buttons
+  // Preset buttons — glass substrate is drawn by the GPU control tier;
+  // here only the ink: label + hairline + active accent tint.
   for (let i = 0; i < GLASS_PRESETS.length; i++) {
     const p = GLASS_PRESETS[i]!;
     const r = presetRectAt(i, w, pad);
     const active = p.id === activePreset;
-    c.fillStyle = active ? 'rgba(45, 79, 216, 0.3)' : 'rgba(15, 23, 42, 0.1)';
-    round(c, r.x, r.y, r.width, r.height, 9);
-    c.fill();
-    c.fillStyle = active ? ctx.theme.text : ctx.theme.textMuted;
+    round(c, r.x + 0.75, r.y + 0.75, r.width - 1.5, r.height - 1.5, 8.5);
+    if (active) {
+      // Solid ink-blue fill reads through the glass; white type on top
+      c.fillStyle = 'rgba(31, 51, 122, 0.62)';
+      c.fill();
+      c.strokeStyle = 'rgba(37, 72, 201, 0.9)';
+      c.lineWidth = 1.5;
+    } else {
+      c.strokeStyle = 'rgba(24, 26, 32, 0.28)';
+      c.lineWidth = 1;
+    }
+    c.stroke();
+    c.fillStyle = active ? 'rgba(255, 255, 255, 0.97)' : ctx.theme.text;
     c.font = `600 13px ${ctx.theme.fontUi}`;
     c.textAlign = 'center';
     c.fillText(p.label, r.x + r.width * 0.5, r.y + 19);
@@ -191,36 +273,65 @@ function paintLab(
   }
 
   for (const s of sliders) {
-    const val = typeof material[s.key] === 'number' ? (material[s.key] as number) : 0;
+    const val = getValue(s.key);
     const t = (val - s.min) / (s.max - s.min);
     const trackW = w - pad * 2;
-    const trackY = s.y + 14;
+    const cy = s.y + 19; // capsule axis (capsule covers s.y+11..s.y+27)
+    const kx = pad + trackW * t;
 
-    c.fillStyle = ctx.theme.textMuted;
+    c.fillStyle = 'rgba(24, 26, 32, 0.85)';
     c.font = `12px ${ctx.theme.fontUi}`;
-    c.fillText(s.label, pad, s.y + 9);
+    c.fillText(s.label, pad, s.y + 7);
     c.textAlign = 'right';
-    c.fillStyle = ctx.theme.accent;
+    c.fillStyle = 'rgba(24, 40, 96, 0.9)';
     c.font = `11px ${ctx.theme.fontMono}`;
-    c.fillText(formatValue(s.step, val), w - pad, s.y + 9);
+    c.fillText(formatValue(s.step, val), w - pad, s.y + 7);
     c.textAlign = 'left';
 
-    c.fillStyle = 'rgba(15, 23, 42, 0.16)';
-    round(c, pad, trackY, trackW, 6, 3);
-    c.fill();
-
-    c.fillStyle = 'rgba(70, 105, 225, 0.55)';
-    round(c, pad, trackY, Math.max(6, trackW * t), 6, 3);
-    c.fill();
-
-    const kx = pad + trackW * t;
-    c.beginPath();
-    c.arc(kx, trackY + 3, 7, 0, Math.PI * 2);
-    c.fillStyle = 'rgba(252, 252, 250, 0.98)';
-    c.fill();
-    c.strokeStyle = 'rgba(24, 26, 32, 0.4)';
+    // Glass tube wall: a faint inner outline so the capsule reads as a
+    // physical tube on bright backgrounds
+    c.strokeStyle = 'rgba(24, 26, 32, 0.13)';
     c.lineWidth = 1;
+    round(c, pad + 0.5, s.y + 11.5, trackW - 1, 15, 7.5);
     c.stroke();
+
+    // Mercury column: a rounded capsule of liquid metal floating well
+    // inside the glass tube (padding on every side) — both ends convex,
+    // mirror shading with a directional sheen. It only appears when there is
+    // liquid to show: at t≈0 just the bead blob; from t>0 the column grows
+    // from the bucket to the fill line.
+    const half = 4;
+    const colX1 = pad + 7;
+    const colX2 = Math.max(kx, colX1 + half + 2);
+    if (t > 0.002) {
+      const colGrad = c.createLinearGradient(0, cy - half, 0, cy + half);
+      colGrad.addColorStop(0, 'rgba(52, 58, 70, 1)');
+      colGrad.addColorStop(0.14, 'rgba(196, 202, 212, 1)');
+      colGrad.addColorStop(0.3, '#ffffff');
+      colGrad.addColorStop(0.42, 'rgba(214, 219, 227, 1)');
+      colGrad.addColorStop(0.68, 'rgba(148, 155, 168, 1)');
+      colGrad.addColorStop(0.88, 'rgba(84, 90, 103, 1)');
+      colGrad.addColorStop(1, 'rgba(40, 45, 56, 1)');
+      c.fillStyle = colGrad;
+      c.beginPath();
+      c.arc(colX1, cy, half, Math.PI / 2, -Math.PI / 2);
+      c.arc(colX2, cy, half, -Math.PI / 2, Math.PI / 2);
+      c.closePath();
+      c.fill();
+      // Directional sheen: environment falls off toward the right end
+      const sheen = c.createLinearGradient(colX1, 0, colX2, 0);
+      sheen.addColorStop(0, 'rgba(255, 255, 255, 0.30)');
+      sheen.addColorStop(1, 'rgba(60, 66, 80, 0.12)');
+      c.fillStyle = sheen;
+      c.fill();
+      c.strokeStyle = 'rgba(30, 35, 45, 0.55)';
+      c.lineWidth = 0.8;
+      c.stroke();
+    }
+
+    // Meniscus bead at the fill line — the drag handle
+    const beadX = Math.max(colX1 + 2, kx);
+    paintMetalBall(c, beadX, cy, 7.5);
   }
 
   // Hint
@@ -242,8 +353,38 @@ function presetRectAt(i: number, w: number, pad: number) {
   };
 }
 
+/** Polished mercury ball: hard radial metal shading, rim, specular dot. */
+function paintMetalBall(
+  c: PaintContext,
+  x: number,
+  y: number,
+  r: number,
+): void {
+  const g = c.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.12, x, y, r * 1.05);
+  g.addColorStop(0, '#ffffff');
+  g.addColorStop(0.4, '#ccd2db');
+  g.addColorStop(0.75, '#878e9b');
+  g.addColorStop(1, '#525866');
+  c.save();
+  c.shadowColor = 'rgba(20, 24, 34, 0.4)';
+  c.shadowBlur = 5;
+  c.shadowOffsetY = 1;
+  c.beginPath();
+  c.arc(x, y, r, 0, Math.PI * 2);
+  c.fillStyle = g;
+  c.fill();
+  c.restore();
+  c.strokeStyle = 'rgba(36, 42, 54, 0.55)';
+  c.lineWidth = 0.9;
+  c.stroke();
+  c.beginPath();
+  c.arc(x - r * 0.35, y - r * 0.42, r * 0.2, 0, Math.PI * 2);
+  c.fillStyle = 'rgba(255, 255, 255, 0.95)';
+  c.fill();
+}
+
 function round(
-  c: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  c: PaintContext,
   x: number,
   y: number,
   w: number,
