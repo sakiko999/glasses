@@ -96,6 +96,14 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
         return null;
       };
 
+      // Track mapping inset by the bead radius: at t=1 the bead's edge —
+      // not its center — touches the capsule end (it used to poke out).
+      const thumbR = 7.5;
+      const tOf = (x: number): number => {
+        const w = ctx.content.width;
+        return Math.min(1, Math.max(0, (x - pad - thumbR) / (w - pad * 2 - thumbR * 2)));
+      };
+
       const hitPreset = (x: number, y: number): GlassPreset | null => {
         const w = ctx.content.width;
         for (let i = 0; i < GLASS_PRESETS.length; i++) {
@@ -125,14 +133,14 @@ export function createGlassLabApp(bridge: GlassLabBridge): AppModule {
           if (s) {
             drag = { key: s.key, min: s.min, max: s.max };
             pressedId = `slider-${String(s.key)}`;
-            const t = Math.min(1, Math.max(0, (x - pad) / (ctx.content.width - pad * 2)));
+            const t = tOf(x);
             const v = s.min + t * (s.max - s.min);
             setValue(s.key, Math.round(v / s.step) * s.step);
             e.preventDefault();
           }
         } else if (e.phase === 'move') {
           if (drag && e.buttons) {
-            const t = Math.min(1, Math.max(0, (x - pad) / (ctx.content.width - pad * 2)));
+            const t = tOf(x);
             const v = drag.min + t * (drag.max - drag.min);
             const step = SLIDERS.find((s) => s.key === drag!.key)?.step ?? 0.01;
             setValue(drag.key, Math.round(v / step) * step);
@@ -277,7 +285,8 @@ function paintLab(
     const t = (val - s.min) / (s.max - s.min);
     const trackW = w - pad * 2;
     const cy = s.y + 19; // capsule axis (capsule covers s.y+11..s.y+27)
-    const kx = pad + trackW * t;
+    // Same inset as the hit mapping — bead stays inside the glass capsule
+    const kx = pad + 7.5 + (trackW - 15) * t;
 
     c.fillStyle = 'rgba(24, 26, 32, 0.85)';
     c.font = `12px ${ctx.theme.fontUi}`;

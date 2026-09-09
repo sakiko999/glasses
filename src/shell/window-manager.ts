@@ -1,7 +1,7 @@
 import type { Rect, Size, Vec2 } from '@/math/types';
 import { clampRectToKeepPointVisible, rect, rectContains } from '@/math/rect';
 import { createId } from '@/math/id';
-import { easeOutCubic } from '@/math/easing';
+import { clamp, easeOutBack, easeOutCubic } from '@/math/easing';
 import type { GlassMaterial, RoundedRectShape } from '@/engine/glass/material';
 import {
   defaultGlassMaterial,
@@ -202,7 +202,8 @@ export class WindowManager {
   update(dt: number): WindowId[] {
     const removed: WindowId[] = [];
     for (const w of this.windows.values()) {
-      const speed = 6.5;
+      // Open ~330ms so the refraction set is readable; close is snappier.
+      const speed = w.closing ? 4.2 : 3.0;
       if (w.anim < w.animTarget) {
         w.anim = Math.min(w.animTarget, w.anim + dt * speed);
       } else if (w.anim > w.animTarget) {
@@ -226,20 +227,33 @@ export class WindowManager {
 
   toLayers(): Layer[] {
     return this.list().map((w) => {
+      // Fluid birth, one `anim` channel driving three staggered reads:
+      // opacity leads (the pane appears as a flat clear sheet), then the
+      // refraction field + dome "set" into the lens (edgeBoost/dispersion/
+      // thickness ease in), while scale overshoots past 1 and settles —
+      // the jelly. Closing runs the same channel in reverse, so windows
+      // collapse back into the droplet for free.
       const t = easeOutCubic(w.anim);
-      const mat = w.focused ? focusBoost(w.material) : w.material;
+      const set = easeOutBack(w.anim);
+      const base = w.focused ? focusBoost(w.material) : w.material;
+      const mat: GlassMaterial = {
+        ...base,
+        edgeBoost: base.edgeBoost * set,
+        dispersion: base.dispersion * set,
+        thickness: Math.max(2, base.thickness * set),
+      };
       return {
         id: w.id,
         zIndex: w.zIndex,
         bounds: w.bounds,
-        opacity: t,
+        opacity: clamp(t * 1.8, 0, 1),
         visible: t > 0.001,
-        scale: 0.96 + 0.04 * t,
+        scale: 0.88 + 0.12 * set,
         material: mat,
         shape: w.shape,
         contentTexture: w.contentTexture,
         titleBarHeight: w.titleBarHeight,
-        shadowStrength: 0.55 + (w.focused ? 0.15 : 0),
+        shadowStrength: (0.55 + (w.focused ? 0.15 : 0)) * t,
       };
     });
   }

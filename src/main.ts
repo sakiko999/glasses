@@ -29,7 +29,8 @@ async function main(): Promise<void> {
 
     desktop.registerApp(createGlassLabApp(desktop.glassBridge));
     desktop.registerApp(clockApp);
-    desktop.start();
+    // `?clean` boots an empty desktop (screenshot workflow)
+    desktop.start({ autoLaunch: !new URLSearchParams(location.search).has('clean') });
 
     // Expose for debugging in console
     (window as unknown as { __glasses: Desktop }).__glasses = desktop;

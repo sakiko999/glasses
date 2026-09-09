@@ -134,14 +134,16 @@ export class Desktop {
     this.launcherDirty = true;
   }
 
-  start(): void {
+  start(options: { autoLaunch?: boolean } = {}): void {
     this.host.surface.resizeToDisplay();
     this.ensureWallpaper();
     this.ensureLauncherSurface();
     this.spawnDemoObjects();
-    // Auto-launch demo apps
-    this.launch('builtin.glass-lab');
-    this.launch('builtin.clock');
+    if (options.autoLaunch ?? true) {
+      // Auto-launch demo apps
+      this.launch('builtin.glass-lab');
+      this.launch('builtin.clock');
+    }
     this.frameLoop.start();
   }
 

@@ -22,3 +22,14 @@ export function easeInOutCubic(t: number): number {
   const x = clamp(t, 0, 1);
   return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
 }
+
+/**
+ * ease-out back — overshoots to ~1.10 at t≈0.7 before settling on 1.
+ * Drives the open/close "jelly" settle of the window scale.
+ */
+export function easeOutBack(t: number): number {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  const u = clamp(t, 0, 1) - 1;
+  return 1 + c3 * u * u * u + c1 * u * u;
+}
